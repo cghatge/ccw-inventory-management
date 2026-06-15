@@ -89,6 +89,7 @@ class DemandForecast(BaseModel):
     forecasted_demand: int
     trend: str
     period: str
+    unit_cost: float
 
 class BacklogItem(BaseModel):
     id: str
@@ -119,6 +120,16 @@ class CreatePurchaseOrderRequest(BaseModel):
     unit_cost: float
     expected_delivery_date: str
     notes: Optional[str] = None
+
+class RestockingOrderItem(BaseModel):
+    sku: str
+    name: str
+    quantity: int
+    unit_price: float
+    trend: str
+
+class CreateRestockingOrderRequest(BaseModel):
+    items: List[RestockingOrderItem]
 
 # API endpoints
 @app.get("/")
@@ -303,6 +314,117 @@ def get_monthly_trends():
     result = list(months.values())
     result.sort(key=lambda x: x['month'])
     return result
+
+@app.post("/api/purchase-orders", response_model=PurchaseOrder, status_code=201)
+def create_purchase_order(request: CreatePurchaseOrderRequest):
+    """Create a new purchase order for a backlog item"""
+    from datetime import datetime
+    new_po = {
+        "id": f"PO-{len(purchase_orders) + 1:04d}",
+        "backlog_item_id": request.backlog_item_id,
+        "supplier_name": request.supplier_name,
+        "quantity": request.quantity,
+        "unit_cost": request.unit_cost,
+        "expected_delivery_date": request.expected_delivery_date,
+        "status": "pending",
+        "created_date": datetime.now().strftime("%Y-%m-%d"),
+        "notes": request.notes
+    }
+    purchase_orders.append(new_po)
+    return new_po
+
+@app.get("/api/purchase-orders/{backlog_item_id}", response_model=PurchaseOrder)
+def get_purchase_order_by_backlog_item(backlog_item_id: str):
+    """Get the purchase order for a specific backlog item"""
+    po = next((po for po in purchase_orders if po["backlog_item_id"] == backlog_item_id), None)
+    if not po:
+        raise HTTPException(status_code=404, detail="Purchase order not found")
+    return po
+
+# In-memory task storage (resets on server restart)
+tasks_store = []
+task_id_counter = 1
+
+class Task(BaseModel):
+    id: int
+    title: str
+    priority: str
+    dueDate: str
+    status: str
+
+class CreateTaskRequest(BaseModel):
+    title: str
+    priority: str
+    dueDate: str
+
+@app.get("/api/tasks", response_model=List[Task])
+def get_tasks():
+    """Get all tasks"""
+    return tasks_store
+
+@app.post("/api/tasks", response_model=Task, status_code=201)
+def create_task(request: CreateTaskRequest):
+    """Create a new task"""
+    global task_id_counter
+    new_task = {
+        "id": task_id_counter,
+        "title": request.title,
+        "priority": request.priority,
+        "dueDate": request.dueDate,
+        "status": "pending"
+    }
+    task_id_counter += 1
+    tasks_store.append(new_task)
+    return new_task
+
+@app.delete("/api/tasks/{task_id}", status_code=204)
+def delete_task(task_id: int):
+    """Delete a task"""
+    global tasks_store
+    task = next((t for t in tasks_store if t["id"] == task_id), None)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    tasks_store = [t for t in tasks_store if t["id"] != task_id]
+
+@app.patch("/api/tasks/{task_id}", response_model=Task)
+def toggle_task(task_id: int):
+    """Toggle task completion status"""
+    task = next((t for t in tasks_store if t["id"] == task_id), None)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    task["status"] = "completed" if task["status"] == "pending" else "pending"
+    return task
+
+@app.post("/api/restocking-orders", response_model=Order, status_code=201)
+def create_restocking_order(request: CreateRestockingOrderRequest):
+    """Create a new internal restocking order from demand forecast recommendations."""
+    from datetime import datetime, timedelta
+
+    if not request.items:
+        raise HTTPException(status_code=400, detail="At least one item is required")
+
+    LEAD_TIME_DAYS = {"increasing": 7, "stable": 14, "decreasing": 21}
+    min_lead = min(LEAD_TIME_DAYS.get(item.trend, 14) for item in request.items)
+
+    now = datetime.now()
+    rst_count = sum(1 for o in orders if o.get("order_number", "").startswith("RST-")) + 1
+    new_order = {
+        "id": str(len(orders) + 1),
+        "order_number": f"RST-{now.year}-{rst_count:04d}",
+        "customer": "Internal Restock",
+        "items": [
+            {"sku": i.sku, "name": i.name, "quantity": i.quantity, "unit_price": i.unit_price}
+            for i in request.items
+        ],
+        "status": "Restock",
+        "order_date": now.isoformat(),
+        "expected_delivery": (now + timedelta(days=min_lead)).isoformat(),
+        "total_value": round(sum(i.quantity * i.unit_price for i in request.items), 2),
+        "warehouse": None,
+        "category": None
+    }
+    orders.append(new_order)
+    return new_order
 
 if __name__ == "__main__":
     import uvicorn
